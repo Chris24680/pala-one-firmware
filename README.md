@@ -1,9 +1,15 @@
 # pala-one-firmware
 Pala One — A tiny E-Ink reader project by Paul Lagier
 
-Pala One is a tiny DIY E-Ink reader built around the Heltec Wireless Paper (ESP32 + E-Ink display).
-
 The goal of the project was to create a simple, distraction-free reading device that feels minimal, portable and easy to build while still looking and behaving more like a real product than a typical DIY electronics project.
+
+## Contributing
+
+If you improve the firmware, add features or fix bugs, feel free to open a pull request.
+Please clearly mention:
+- which board version you modified
+- what was changed
+- how it was tested
 
 ## Board Versions
 
