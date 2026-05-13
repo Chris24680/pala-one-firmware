@@ -21,6 +21,30 @@ The board version is usually printed on the back of the PCB.
 
 Both versions are built from the same source file (`Pala_One_2_1/Pala_One_2_1.ino`). Open it in Arduino IDE and uncomment the `#define` at the top that matches your hardware before compiling.
 
+## Apps
+
+The firmware includes an optional Apps menu. Each app can be independently included or excluded by commenting out its `#define` near the top of `Pala_One_2_1/Pala_One_2_1.ino`:
+
+```cpp
+// ── Apps: comment out any app you don't want compiled into the firmware ───────
+#define APP_CLICK_COUNTER
+```
+
+If all apps are commented out, the Apps entry disappears from the library menu entirely.
+
+### Adding a new app
+
+1. Add a `#define APP_FOO` line in the apps block at the top of the `.ino`, and add `|| defined(APP_FOO)` to the `ANY_APP_DEFINED` chain directly below it.
+2. Add a `"Foo",` entry inside an `#ifdef APP_FOO` slot in the `apps[]` array inside `drawAppsMenu()`.
+3. Add a dispatch block inside the `doubleClick` branch of `handleModeApps()`:
+   ```cpp
+   #ifdef APP_FOO
+   if (g_appsSelectedIndex == i) { mode = MODE_FOO; drawFoo(); return; }
+   i++;
+   #endif
+   ```
+4. Wrap the app's own mode value (`MODE_FOO`), state variables, draw function, and handler function each in `#ifdef APP_FOO`.
+
 ## Features
 
 - TXT book support
