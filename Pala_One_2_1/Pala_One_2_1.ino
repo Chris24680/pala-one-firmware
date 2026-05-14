@@ -5,13 +5,9 @@
 // #define BOARD_V1_2
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── Apps: comment out any app you don't want compiled into the firmware ───────
-#define APP_CLICK_COUNTER
-// ─────────────────────────────────────────────────────────────────────────────
-// Add each new app to this OR chain so the Apps menu entry appears automatically
-#if defined(APP_CLICK_COUNTER)
-#  define ANY_APP_DEFINED
-#endif
+#include "pala_app.h"
+#include "pala_api.h"
+#include <stdarg.h>
 #ifdef BOARD_V1_1
   using DisplayType = EInkDisplay_WirelessPaperV1_1;
 #else
@@ -37,6 +33,8 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include <esp_sleep.h>
+#include <esp_heap_caps.h>
+#include <soc/soc.h>
 
 // ============================================================================
 //  Firmware / Product constants
@@ -103,12 +101,7 @@ enum Mode {
   MODE_BM_BOOK_SELECT,
   MODE_BM_LIST,
   MODE_BM_PREVIEW,
-#ifdef ANY_APP_DEFINED
   MODE_APPS,
-#endif
-#ifdef APP_CLICK_COUNTER
-  MODE_CLICK_COUNTER,
-#endif
 };
 
 enum ReaderLongPressAction {
@@ -123,9 +116,7 @@ enum LibraryEntryType {
   LIB_ENTRY_LIST,
   LIB_ENTRY_ABOUT,
   LIB_ENTRY_UPLOAD,
-#ifdef ANY_APP_DEFINED
   LIB_ENTRY_APPS,
-#endif
 };
 
 struct BookInfo {
@@ -212,9 +203,25 @@ struct ListState {
   int selectedIndex = 0;
 };
 
+#define MAX_APPS     16
+#define MAX_APP_NAME 32
+#define MAX_APP_PATH 80
+
+struct AppDiscovery {
+  char name[MAX_APP_NAME + 1];
+  char path[MAX_APP_PATH + 1];
+};
+
+struct AppsState {
+  AppDiscovery apps[MAX_APPS];
+  int count         = 0;
+  int selectedIndex = 0;
+};
+
 struct UploadState {
   File bookTmpFile;
   File sleepTmpFile;
+  File appTmpFile;
 
   String bookTmpPath;
   String bookPendingUtf8Tail;
@@ -225,6 +232,11 @@ struct UploadState {
   String sleepTmpPath;
   bool sleepOk = false;
   String sleepError;
+
+  String appTmpPath;
+  String appFinalName;
+  bool appOk = false;
+  String appError;
 
   uint32_t startedMs = 0;
 };
@@ -255,6 +267,8 @@ struct ButtonState {
   bool quadClick = false;
   bool longClick = false;
 
+  uint32_t rawPressCount = 0; // every short press-release, unfiltered by multi-click windows
+
   void resetClicks() {
     shortClick = false;
     doubleClick = false;
@@ -271,6 +285,7 @@ struct ButtonState {
     lastRelease = 0;
     firstClickRelease = 0;
     clickCount = 0;
+    rawPressCount = 0;
     resetClicks();
   }
 
@@ -309,12 +324,10 @@ uint32_t g_offsetCacheStamp = 1;
 
 uint32_t lastUserActionMs = 0;
 int menuDrawsSinceFull = 0;
-#ifdef ANY_APP_DEFINED
-static int g_appsSelectedIndex = 0;
-#endif
-#ifdef APP_CLICK_COUNTER
-static int g_clickCounter = 0;
-#endif
+static AppsState g_apps;
+static PalaAPI   g_palaAPI;
+static void*     g_appExecBuf  = nullptr;
+static size_t    g_appExecSize = 0;
 LayoutMetrics g_metrics;
 bool g_metricsValid = false;
 
@@ -533,6 +546,7 @@ void ButtonState::poll() {
           clickCount = 0;
           longClick = true;
         } else {
+          rawPressCount++;  // count every short press unconditionally
           clickCount++;
           lastRelease = edgeT;
           if (clickCount == 1) firstClickRelease = edgeT;
@@ -554,7 +568,7 @@ void ButtonState::poll() {
     else if (clickCount == 3) emit = (uint32_t)(now - firstClickRelease) > TRIPLE_MS;
 
     if (emit) {
-      if (clickCount == 1) shortClick = true;
+      if (clickCount == 1) shortClick  = true;
       else if (clickCount == 2) doubleClick = true;
       else if (clickCount == 3) tripleClick = true;
       clickCount = 0;
@@ -1248,9 +1262,7 @@ static String libraryEntryLabel(int idx) {
     case LIB_ENTRY_LIST:      return "List";
     case LIB_ENTRY_ABOUT:     return "Device";
     case LIB_ENTRY_UPLOAD:    return "Upload";
-#ifdef ANY_APP_DEFINED
     case LIB_ENTRY_APPS:      return "Apps";
-#endif
   }
   return "";
 }
@@ -1314,14 +1326,12 @@ static void buildLibraryEntries() {
     g_library.entryDepths[g_library.entryCount] = 0;
     g_library.entryCount++;
   }
-#ifdef ANY_APP_DEFINED
   if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
     g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_APPS;
     g_library.entryRefs[g_library.entryCount] = -1;
     g_library.entryDepths[g_library.entryCount] = 0;
     g_library.entryCount++;
   }
-#endif
   if (g_library.entryCount < MAX_LIBRARY_ENTRIES) {
     g_library.entryTypes[g_library.entryCount] = LIB_ENTRY_UPLOAD;
     g_library.entryRefs[g_library.entryCount] = -1;
@@ -2351,9 +2361,7 @@ static void drawLibrary() {
     bool isSystem = (g_library.entryTypes[idx] == LIB_ENTRY_BOOKMARKS ||
                      g_library.entryTypes[idx] == LIB_ENTRY_LIST ||
                      g_library.entryTypes[idx] == LIB_ENTRY_ABOUT ||
-#ifdef ANY_APP_DEFINED
                      g_library.entryTypes[idx] == LIB_ENTRY_APPS ||
-#endif
                      g_library.entryTypes[idx] == LIB_ENTRY_UPLOAD);
     bool boldText = (idx == g_library.selectedItem);
     drawMenuBulletRow(y, label, idx == g_library.selectedItem, boldText, g_library.entryDepths[idx], isSystem);
@@ -2457,52 +2465,292 @@ static void drawAbout() {
   display.update();
 }
 
-#ifdef ANY_APP_DEFINED
+static void scanApps() {
+  g_apps.count = 0;
+
+  if (!FS.exists("/apps")) {
+    FS.mkdir("/apps");
+    return;
+  }
+
+  File dir = FS.open("/apps");
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    return;
+  }
+
+  File f = dir.openNextFile();
+  while (f && g_apps.count < MAX_APPS) {
+    String entryName = String(f.name());
+    f.close();
+
+    if (!entryName.endsWith(".bin")) {
+      f = dir.openNextFile();
+      continue;
+    }
+
+    String absPath = entryName.startsWith("/") ? entryName : (String("/apps/") + entryName);
+    AppDiscovery& entry = g_apps.apps[g_apps.count];
+
+    File hf = FS.open(absPath, "r");
+    bool usedHeader = false;
+    if (hf && hf.size() >= sizeof(PalaAppHeader)) {
+      PalaAppHeader hdr;
+      if (hf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr) &&
+          hdr.magic == PALA_APP_MAGIC) {
+        hdr.name[MAX_APP_NAME] = '\0';
+        strncpy(entry.name, hdr.name, MAX_APP_NAME);
+        entry.name[MAX_APP_NAME] = '\0';
+        usedHeader = true;
+      }
+    }
+    if (hf) hf.close();
+
+    if (!usedHeader) {
+      String stem = lastPathComponent(absPath);
+      if (stem.endsWith(".bin")) stem = stem.substring(0, stem.length() - 4);
+      stem.replace('_', ' ');
+      strncpy(entry.name, stem.c_str(), MAX_APP_NAME);
+      entry.name[MAX_APP_NAME] = '\0';
+    }
+
+    strncpy(entry.path, absPath.c_str(), MAX_APP_PATH);
+    entry.path[MAX_APP_PATH] = '\0';
+    g_apps.count++;
+
+    f = dir.openNextFile();
+  }
+  if (f) f.close();
+  dir.close();
+
+  if (g_apps.selectedIndex >= g_apps.count) g_apps.selectedIndex = 0;
+}
+
+// ---- PalaAPI wrapper implementations ----------------------------------------
+
+static void api_clearScreen() {
+  prepareMenuFrame();
+}
+
+static void api_drawHeader(const char* title) {
+  drawSectionHeader(title);
+}
+
+static void api_drawTextAt(int x, int y, const char* text, int bold) {
+  u8g2.setFont(bold ? BOLD_FONT : MAIN_FONT);
+  u8g2.setCursor(x, y);
+  u8g2.print(text);
+}
+
+static void api_drawCenteredLarge(const char* text) {
+  u8g2.setFont(u8g2_font_helvB14_te);
+  int w   = u8g2.getUTF8Width(text);
+  int asc = u8g2.getFontAscent();
+  // centre horizontally; vertically centred in the space below y=20 (approx header height)
+  u8g2.setCursor((SCREEN_W - w) / 2, (SCREEN_H + 20 + asc) / 2);
+  u8g2.print(text);
+  u8g2.setFont(MAIN_FONT);
+}
+
+static void api_refreshDisplay() {
+  display.update();
+}
+
+static uint8_t api_waitForEvent() {
+  markUserActivity();
+  while (true) {
+    btns.poll();
+    // Long press fires while the button is still held (not on release).
+    if (btns.pressArmed && btns.stablePressed) {
+      uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+      if ((uint32_t)(now - btns.pressStart) >= LONG_MS) {
+        btns.pressArmed = false;
+        btns.pressStart = 0;
+        markUserActivity();
+        return PALA_LONG;
+      }
+    }
+    if (btns.tripleClick) { btns.resetClicks(); markUserActivity(); return PALA_TRIPLE; }
+    if (btns.doubleClick) { btns.resetClicks(); markUserActivity(); return PALA_DOUBLE; }
+    if (btns.shortClick)  { btns.resetClicks(); markUserActivity(); return PALA_CLICK; }
+    delay(1);
+  }
+}
+
+static uint8_t api_pollEvent() {
+  btns.poll();
+  if (btns.longClick)   { btns.resetClicks(); markUserActivity(); return PALA_LONG; }
+  if (btns.tripleClick) { btns.resetClicks(); markUserActivity(); return PALA_TRIPLE; }
+  if (btns.doubleClick) { btns.resetClicks(); markUserActivity(); return PALA_DOUBLE; }
+  if (btns.shortClick)  { btns.resetClicks(); markUserActivity(); return PALA_CLICK; }
+  return 0;
+}
+
+static uint32_t api_millisNow() {
+  return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static int api_buttonPressed() {
+  return btns.stablePressed ? 1 : 0;
+}
+
+static void api_delayMs(uint32_t ms) {
+  delay(ms);
+}
+
+static uint32_t api_pendingPresses() {
+  btns.poll();
+  uint32_t n = btns.rawPressCount;
+  btns.rawPressCount = 0;
+  return n;
+}
+
+static int api_snprintf_wrap(char* buf, int len, const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  int r = vsnprintf(buf, (size_t)len, fmt, args);
+  va_end(args);
+  return r;
+}
+
+static void initPalaAPI() {
+  g_palaAPI.clearScreen       = api_clearScreen;
+  g_palaAPI.drawHeader        = api_drawHeader;
+  g_palaAPI.drawTextAt        = api_drawTextAt;
+  g_palaAPI.drawCenteredLarge = api_drawCenteredLarge;
+  g_palaAPI.refreshDisplay    = api_refreshDisplay;
+  g_palaAPI.waitForEvent      = api_waitForEvent;
+  g_palaAPI.snprintf_wrap     = api_snprintf_wrap;
+  g_palaAPI.pollEvent         = api_pollEvent;
+  g_palaAPI.millisNow         = api_millisNow;
+  g_palaAPI.buttonPressed     = api_buttonPressed;
+  g_palaAPI.delayMs           = api_delayMs;
+  g_palaAPI.pendingPresses    = api_pendingPresses;
+}
+
+// ---- App loader -------------------------------------------------------------
+
+static void freeAppExecBuf() {
+  if (g_appExecBuf) {
+    heap_caps_free(g_appExecBuf);
+    g_appExecBuf  = nullptr;
+    g_appExecSize = 0;
+  }
+}
+
+static bool loadAndRunApp(const char* path) {
+  freeAppExecBuf();
+
+  File f = FS.open(path, "r");
+  if (!f) { drawCenter("App not found", path); delay(1500); return false; }
+
+  size_t fileSize = f.size();
+  if (fileSize < sizeof(PalaAppHeader) + 4) {
+    f.close(); drawCenter("App too small", "Invalid file"); delay(1500); return false;
+  }
+
+  const size_t MAX_APP_BINARY = 48 * 1024;
+  if (fileSize > MAX_APP_BINARY) {
+    f.close(); drawCenter("App too large", "> 48 KB"); delay(1500); return false;
+  }
+
+  g_appExecBuf = heap_caps_malloc(fileSize, MALLOC_CAP_EXEC | MALLOC_CAP_32BIT);
+  if (!g_appExecBuf) {
+    f.close();
+    char msg[32];
+    snprintf(msg, sizeof(msg), "Need %u bytes", (unsigned)fileSize);
+    drawCenter("No exec memory", msg);
+    delay(1500);
+    return false;
+  }
+  g_appExecSize = fileSize;
+
+  // heap_caps_malloc(MALLOC_CAP_EXEC) returns an IRAM instruction-bus address (0x403xxxxx).
+  // On ESP32-S3 that address is not writable from the data bus; use the DIRAM DRAM view
+  // (same physical SRAM, shifted by SOC_I_D_OFFSET) for all reads and writes.
+  uint8_t* dataBuf = (uint8_t*)MAP_IRAM_TO_DRAM((uint32_t)g_appExecBuf);
+
+  size_t bytesRead = f.read(dataBuf, fileSize);
+  f.close();
+  if (bytesRead != fileSize) {
+    freeAppExecBuf(); drawCenter("Read error", "Partial read"); delay(1500); return false;
+  }
+
+  PalaAppHeader* hdr = (PalaAppHeader*)dataBuf;
+
+  if (hdr->magic != PALA_APP_MAGIC) {
+    freeAppExecBuf(); drawCenter("Bad app file", "Wrong magic"); delay(1500); return false;
+  }
+  if (hdr->api_version != PALA_API_VERSION) {
+    char msg[32];
+    snprintf(msg, sizeof(msg), "API v%u, need v%u",
+             (unsigned)hdr->api_version, (unsigned)PALA_API_VERSION);
+    freeAppExecBuf(); drawCenter("API mismatch", msg); delay(1500); return false;
+  }
+
+  if (hdr->entry_offset < sizeof(PalaAppHeader) || hdr->entry_offset >= fileSize) {
+    freeAppExecBuf(); drawCenter("Bad entry offset", nullptr); delay(1500); return false;
+  }
+
+  // l32r uses the instruction bus (can reach IRAM), but firmware data loads use the data
+  // bus (cannot reach IRAM). Relocations must therefore resolve to DRAM addresses so that
+  // string/data pointers passed to firmware API functions are data-bus accessible.
+  uint32_t base = (uint32_t)dataBuf;
+  if (hdr->reloc_count > 0) {
+    if (hdr->reloc_offset < sizeof(PalaAppHeader) ||
+        hdr->reloc_offset + hdr->reloc_count * 4u > fileSize) {
+      freeAppExecBuf(); drawCenter("Bad reloc table", nullptr); delay(1500); return false;
+    }
+    uint32_t* relocs = (uint32_t*)(dataBuf + hdr->reloc_offset);
+    for (uint32_t i = 0; i < hdr->reloc_count; i++) {
+      uint32_t off = relocs[i];
+      if (off + 4u > hdr->reloc_offset) {
+        freeAppExecBuf(); drawCenter("Reloc out of range", nullptr); delay(1500); return false;
+      }
+      *(uint32_t*)(dataBuf + off) += base;
+    }
+  }
+
+  pala_app_entry_t entry = (pala_app_entry_t)((uint8_t*)g_appExecBuf + hdr->entry_offset);
+
+  resetInputFrontend();
+  entry(&g_palaAPI);
+
+  freeAppExecBuf();
+  resetInputFrontend();
+  return true;
+}
+
+// ---- Apps menu draw / handle ------------------------------------------------
+
 static void drawAppsMenu() {
   prepareMenuFrame();
   u8g2.setFont(MAIN_FONT);
-  int ascent = u8g2.getFontAscent();
+  int ascent  = u8g2.getFontAscent();
   int descent = u8g2.getFontDescent();
-  int lineH = (ascent - descent) + g_settings.lineGap + 1;
+  int lineH   = (ascent - descent) + g_settings.lineGap + 1;
   int y = drawSectionHeader("Apps");
 
-  const char* apps[] = {
-#ifdef APP_CLICK_COUNTER
-    "Click Counter",
-#endif
-  };
-  const int appCount = (int)(sizeof(apps) / sizeof(apps[0]));
+  if (g_apps.count == 0) {
+    drawMenuBulletRow(y, "No apps installed", true, false, 0, false);
+    display.update();
+    return;
+  }
 
-  for (int i = 0; i < appCount; i++) {
-    bool selected = (i == g_appsSelectedIndex);
-    u8g2.setFont(selected ? BOLD_FONT : MAIN_FONT);
-    u8g2.setCursor(UI_LIST_LEFT, y);
-    u8g2.print(apps[i]);
+  int visible = max(2, (SCREEN_H - y - BOT_PAD) / lineH);
+  int top     = g_apps.selectedIndex - (visible / 2);
+  top = max(0, min(top, g_apps.count - visible));
+
+  for (int i = 0; i < visible; i++) {
+    int idx = top + i;
+    if (idx >= g_apps.count) break;
+    bool sel = (idx == g_apps.selectedIndex);
+    drawMenuBulletRow(y, String(g_apps.apps[idx].name), sel, sel, 0, false);
     y += lineH;
   }
 
   display.update();
 }
-#endif
-
-#ifdef APP_CLICK_COUNTER
-static void drawClickCounter() {
-  prepareMenuFrame();
-  u8g2.setFont(MAIN_FONT);
-  int y = drawSectionHeader("Click Counter");
-
-  u8g2.setFont(u8g2_font_helvB14_te);
-  String val = String(g_clickCounter);
-  int w = u8g2.getUTF8Width(val.c_str());
-  int numAscent = u8g2.getFontAscent();
-  int cx = (SCREEN_W - w) / 2;
-  int cy = y + numAscent + ((SCREEN_H - y - numAscent) / 2) - 4;
-  u8g2.setCursor(cx, cy);
-  u8g2.print(val.c_str());
-
-  display.update();
-}
-#endif
 
 static void drawBookmarksBookSelect() {
   prepareMenuFrame();
@@ -2793,6 +3041,15 @@ static void handleRoot() {
     "<div class='actions'><button type='submit'>Upload</button><a class='btn secondary' href='/files'>Manage files</a></div>"
     "</form></div>";
 
+  out +=
+    "<div class='card'><h2>Upload app (.bin)</h2>"
+    "<p class='muted'>Upload a Pala app binary compiled with the Pala SDK. "
+    "Files are stored in <b>/apps/</b> and appear in the Apps menu on the device.</p>"
+    "<form method='POST' action='/upload-app' enctype='multipart/form-data' style='margin-top:14px'>"
+    "<input type='file' name='file' accept='.bin,application/octet-stream' required>"
+    "<div class='actions'><button type='submit'>Upload app</button></div>"
+    "</form></div>";
+
   out += "<div class='card'><h2>Notes</h2><p class='muted'>Uploaded books are normalized and compacted before saving, so a source TXT can be larger than the final stored file. The reader is optimized for UTF-8 plain text and Latin-based languages.</p></div>";
 
   out += webPageEnd();
@@ -2872,8 +3129,55 @@ static void handleFiles() {
   }
 
   out += "</div>";
+
+  out += "<div class='card'><h2>Apps</h2>";
+  {
+    File appsDir = FS.open("/apps");
+    bool anyApp = false;
+    if (appsDir) {
+      File f = appsDir.openNextFile();
+      while (f) {
+        String name = String(f.name());
+        if (name.endsWith(".bin")) {
+          if (!anyApp) { out += "<ul class='list'>"; anyApp = true; }
+          out += "<li><div class='row'><div><h3>";
+          out += htmlEscape(name);
+          out += "</h3><div class='meta'>";
+          out += String((int)f.size());
+          out += " bytes</div></div><div><form method='POST' action='/del-app' style='display:inline'>";
+          out += "<input type='hidden' name='name' value='";
+          out += htmlEscape(name);
+          out += "'><button type='submit' class='btn secondary' onclick=\"return confirm('Delete app?')\">Delete</button></form></div></div></li>";
+        }
+        f.close();
+        f = appsDir.openNextFile();
+      }
+      appsDir.close();
+    }
+    if (!anyApp) out += "<p class='muted'>No apps installed.</p>";
+    else out += "</ul>";
+  }
+  out += "</div>";
+
   out += webPageEnd();
   server.send(200, "text/html; charset=utf-8", out);
+}
+
+static void handleDeleteApp() {
+  if (!server.hasArg("name")) {
+    server.send(400, "text/plain; charset=utf-8", "missing name");
+    return;
+  }
+  String name = server.arg("name");
+  // reject anything with path separators
+  if (name.indexOf('/') >= 0 || name.indexOf('\\') >= 0 || !name.endsWith(".bin")) {
+    server.send(400, "text/plain; charset=utf-8", "invalid name");
+    return;
+  }
+  String path = "/apps/" + name;
+  FS.remove(path);
+  server.sendHeader("Location", "/files");
+  server.send(303);
 }
 
 static void handleDelete() {
@@ -3742,13 +4046,111 @@ static void handleUploadSleepStream() {
   }
 }
 
+static void handleUploadAppDone() {
+  if (!g_upload.appOk) {
+    server.send(400, "text/plain; charset=utf-8",
+                g_upload.appError.length() ? g_upload.appError : "App upload failed");
+    return;
+  }
+  String inner;
+  inner.reserve(400);
+  inner += "<div class='card'><h2>App uploaded</h2>"
+           "<p class='muted'>App is now available in the Apps menu on the device.</p>"
+           "<div class='actions'><a class='btn' href='/'>Upload another</a></div></div>";
+  String page = successPage("App uploaded", "App saved.", "&#10003; App ready.", inner);
+  server.send(200, "text/html; charset=utf-8", page);
+}
+
+static void handleUploadAppStream() {
+  HTTPUpload& up = server.upload();
+
+  if (up.status == UPLOAD_FILE_START) {
+    g_upload.appOk = false;
+    g_upload.appError = "";
+    g_upload.appFinalName = "";
+    g_upload.appTmpPath = "";
+
+    size_t freeBytes = fsFreeBytesSafe();
+    if (freeBytes < 4096) {
+      g_upload.appError = "Not enough free space";
+      return;
+    }
+
+    // sanitizeUploadedFilename appends .txt; strip all extensions then re-add .bin
+    String fname = sanitizeUploadedFilename(up.filename);
+    int dot = fname.lastIndexOf('.');
+    while (dot > 0) { fname = fname.substring(0, dot); dot = fname.lastIndexOf('.'); }
+    if (fname.length() == 0) fname = "app";
+    fname += ".bin";
+
+    g_upload.appFinalName = fname;
+    g_upload.appTmpPath = "/apps/" + fname + ".tmp";
+    if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
+    g_upload.appTmpFile = FS.open(g_upload.appTmpPath, "w");
+    if (!g_upload.appTmpFile) {
+      g_upload.appError = "Cannot create temp app file";
+      g_upload.appTmpPath = "";
+    }
+  }
+  else if (up.status == UPLOAD_FILE_WRITE) {
+    if (g_upload.appError.length() > 0) return;
+    if (g_upload.appTmpFile) g_upload.appTmpFile.write(up.buf, up.currentSize);
+  }
+  else if (up.status == UPLOAD_FILE_END) {
+    if (g_upload.appTmpFile) g_upload.appTmpFile.close();
+    if (g_upload.appError.length() > 0 || g_upload.appTmpPath.length() == 0) return;
+
+    if (up.totalSize < sizeof(PalaAppHeader) + 4) {
+      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
+      g_upload.appError = "App binary too small";
+      g_upload.appTmpPath = "";
+      return;
+    }
+
+    // Validate magic before committing
+    bool validMagic = false;
+    File vf = FS.open(g_upload.appTmpPath, "r");
+    if (vf) {
+      PalaAppHeader hdr;
+      if (vf.read((uint8_t*)&hdr, sizeof(hdr)) == sizeof(hdr))
+        validMagic = (hdr.magic == PALA_APP_MAGIC);
+      vf.close();
+    }
+    if (!validMagic) {
+      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
+      g_upload.appError = "Invalid app binary (bad magic)";
+      g_upload.appTmpPath = "";
+      return;
+    }
+
+    String finalPath = "/apps/" + g_upload.appFinalName;
+    if (FS.exists(finalPath)) FS.remove(finalPath);
+    if (FS.rename(g_upload.appTmpPath, finalPath)) {
+      g_upload.appOk = true;
+    } else {
+      if (FS.exists(g_upload.appTmpPath)) FS.remove(g_upload.appTmpPath);
+      g_upload.appError = "Failed to finalize app upload";
+    }
+    g_upload.appTmpPath = "";
+  }
+  else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (g_upload.appTmpFile) g_upload.appTmpFile.close();
+    if (g_upload.appTmpPath.length() > 0 && FS.exists(g_upload.appTmpPath))
+      FS.remove(g_upload.appTmpPath);
+    g_upload.appTmpPath = "";
+    g_upload.appOk = false;
+    g_upload.appError = "Upload aborted";
+  }
+}
+
 // ============================================================================
 //  Upload mode / server lifecycle
 // ============================================================================
 static void registerWebRoutes() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/files", HTTP_GET, handleFiles);
-  server.on("/del",   HTTP_POST, handleDelete);   // POST: prevents accidental deletion via browser prefetch
+  server.on("/del",     HTTP_POST, handleDelete);   // POST: prevents accidental deletion via browser prefetch
+  server.on("/del-app", HTTP_POST, handleDeleteApp);
   server.on("/mkdir", HTTP_POST, handleCreateFolder);
   server.on("/move", HTTP_POST, handleMoveBook);
   server.on("/jumppage", HTTP_POST, handleJumpPageWeb);
@@ -3770,6 +4172,7 @@ static void registerWebRoutes() {
   server.on("/del-sleep", HTTP_GET, handleDeleteSleepImg);
 
   server.on("/upload-sleep", HTTP_POST, handleUploadSleepDone, handleUploadSleepStream);
+  server.on("/upload-app",   HTTP_POST, handleUploadAppDone,   handleUploadAppStream);
   server.on("/upload", HTTP_POST, handleUploadDone, handleUploadBookStream);
 }
 
@@ -3825,8 +4228,9 @@ static void startUploadMode() {
 static void stopUploadModeToLibrary() {
   server.stop();
 
-  if (g_upload.bookTmpFile) g_upload.bookTmpFile.close();
+  if (g_upload.bookTmpFile)  g_upload.bookTmpFile.close();
   if (g_upload.sleepTmpFile) g_upload.sleepTmpFile.close();
+  if (g_upload.appTmpFile)   g_upload.appTmpFile.close();
 
   WiFi.softAPdisconnect(true);
   WiFi.disconnect(true, true);
@@ -3844,6 +4248,11 @@ static void stopUploadModeToLibrary() {
   g_upload.sleepOk = false;
   g_upload.sleepError = "";
   g_upload.sleepTmpPath = "";
+
+  g_upload.appOk = false;
+  g_upload.appError = "";
+  g_upload.appTmpPath = "";
+  g_upload.appFinalName = "";
 
   loadBooks();
   mode = MODE_LIBRARY;
@@ -3924,6 +4333,7 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(BTN), btnISR, CHANGE);
 
   u8g2.begin(gfx);
+  initPalaAPI();
   invalidateMetrics();
   (void)getMetrics();
   resetOffsetCache();
@@ -3942,6 +4352,7 @@ void setup() {
     return;
   }
   ensureBooksDir();
+  if (!FS.exists("/apps")) FS.mkdir("/apps");
 
   {
     uint64_t chipId = ESP.getEfuseMac();
@@ -4000,56 +4411,22 @@ static void handleModeAbout() {
   }
 }
 
-#ifdef ANY_APP_DEFINED
 static void handleModeApps() {
-  const char* apps[] = {
-#ifdef APP_CLICK_COUNTER
-    "",
-#endif
-  };
-  const int appCount = (int)(sizeof(apps) / sizeof(apps[0]));
-
   if (btns.shortClick) {
-    g_appsSelectedIndex = (g_appsSelectedIndex + 1) % appCount;
+    if (g_apps.count > 0)
+      g_apps.selectedIndex = (g_apps.selectedIndex + 1) % g_apps.count;
     drawAppsMenu();
     return;
   }
   if (btns.doubleClick) {
-    int i = 0;
-#ifdef APP_CLICK_COUNTER
-    if (g_appsSelectedIndex == i) { mode = MODE_CLICK_COUNTER; drawClickCounter(); return; }
-    i++;
-#endif
-    (void)i;
+    if (g_apps.count > 0 && g_apps.selectedIndex < g_apps.count) {
+      loadAndRunApp(g_apps.apps[g_apps.selectedIndex].path);
+      drawAppsMenu();
+    }
     return;
   }
   // Triple-click handled globally → library root
 }
-#endif
-
-#ifdef APP_CLICK_COUNTER
-static void handleModeClickCounter() {
-  // Fire while the button is still held — no need to release first.
-  // Disarm the press so the subsequent release doesn't re-trigger.
-  if (btns.stablePressed && btns.pressArmed &&
-      (uint32_t)(millis() - btns.pressStart) >= LONG_MS) {
-    btns.pressArmed = false;
-    g_clickCounter = 0;
-    mode = MODE_APPS;
-    drawAppsMenu();
-    return;
-  }
-  int add = 0;
-  if (btns.shortClick)  add = 1;
-  if (btns.doubleClick) add = 2;
-  if (btns.tripleClick) add = 3;
-  if (btns.quadClick)   add = 4;
-  if (add > 0) {
-    g_clickCounter += add;
-    drawClickCounter();
-  }
-}
-#endif
 
 static void handleModeBookmarkBookSelect() {
   if (btns.tripleClick) {
@@ -4246,14 +4623,13 @@ static void handleModeLibrary() {
     return;
   }
 
-#ifdef ANY_APP_DEFINED
   if (entryType == LIB_ENTRY_APPS) {
-    g_appsSelectedIndex = 0;
+    g_apps.selectedIndex = 0;
+    scanApps();
     mode = MODE_APPS;
     drawAppsMenu();
     return;
   }
-#endif
 
   startUploadMode();
 }
@@ -4370,11 +4746,7 @@ void loop() {
   if (btns.tripleClick && mode != MODE_UPLOAD
       && mode != MODE_BM_PREVIEW
       && mode != MODE_BM_LIST
-      && mode != MODE_BM_BOOK_SELECT
-#ifdef APP_CLICK_COUNTER
-      && mode != MODE_CLICK_COUNTER
-#endif
-      ) {
+      && mode != MODE_BM_BOOK_SELECT) {
     enterLibraryRoot(true);
     markUserActivity();
     return;
@@ -4384,12 +4756,7 @@ void loop() {
     case MODE_UPLOAD:         handleModeUpload(); break;
     case MODE_ABOUT:          handleModeAbout(); break;
     case MODE_LIST:           handleModeList(); break;
-#ifdef ANY_APP_DEFINED
     case MODE_APPS:           handleModeApps(); break;
-#endif
-#ifdef APP_CLICK_COUNTER
-    case MODE_CLICK_COUNTER:  handleModeClickCounter(); break;
-#endif
     case MODE_BM_BOOK_SELECT: handleModeBookmarkBookSelect(); break;
     case MODE_BM_LIST:        handleModeBookmarkList(); break;
     case MODE_BM_PREVIEW:     handleModeBookmarkPreview(); break;

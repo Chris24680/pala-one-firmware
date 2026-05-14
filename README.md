@@ -23,27 +23,52 @@ Both versions are built from the same source file (`Pala_One_2_1/Pala_One_2_1.in
 
 ## Apps
 
-The firmware includes an optional Apps menu. Each app can be independently included or excluded by commenting out its `#define` near the top of `Pala_One_2_1/Pala_One_2_1.ino`:
+Apps are compiled separately and uploaded to the device via the WiFi web interface — no firmware rebuild needed. The Apps menu discovers all `.bin` files in `/apps/` on the device and lists them by name.
 
-```cpp
-// ── Apps: comment out any app you don't want compiled into the firmware ───────
-#define APP_CLICK_COUNTER
+### Building an app
+
+You need:
+- The `xtensa-esp32s3-elf-gcc` cross-compiler, which ships with the Arduino ESP32 board package. On Linux it is found under `~/.arduino15/packages/esp32/tools/esp-x32/<version>/bin/`; the `Makefile` locates it automatically.
+- `python3` (for the post-build step that patches the entry point offset into the binary).
+
+An app is a single C file that includes `pala_app.h` and `pala_api.h` from the firmware source and exports a `void app_main(const PalaAPI* api)` entry point. The header struct at the start of the binary carries the display name and API version check.
+
+See `examples/click_counter/` for a complete working example with a `Makefile`.
+
+```bash
+cd examples/click_counter
+make
+# produces click_counter.bin
 ```
 
-If all apps are commented out, the Apps entry disappears from the library menu entirely.
+### Uploading an app
 
-### Adding a new app
+1. Select **Upload** from the library menu on the device.
+2. Connect to the `PALA-XXXXXX` WiFi network (password: `palaread`).
+3. Open `http://192.168.4.1` in a browser.
+4. Use the **Upload app (.bin)** card to upload your `.bin` file.
+5. Triple-click to exit upload mode — the app will appear in the Apps menu immediately.
 
-1. Add a `#define APP_FOO` line in the apps block at the top of the `.ino`, and add `|| defined(APP_FOO)` to the `ANY_APP_DEFINED` chain directly below it.
-2. Add a `"Foo",` entry inside an `#ifdef APP_FOO` slot in the `apps[]` array inside `drawAppsMenu()`.
-3. Add a dispatch block inside the `doubleClick` branch of `handleModeApps()`:
-   ```cpp
-   #ifdef APP_FOO
-   if (g_appsSelectedIndex == i) { mode = MODE_FOO; drawFoo(); return; }
-   i++;
-   #endif
-   ```
-4. Wrap the app's own mode value (`MODE_FOO`), state variables, draw function, and handler function each in `#ifdef APP_FOO`.
+### App API
+
+Apps communicate with the firmware through the `PalaAPI` function pointer table passed to `app_main`. Available functions (v1):
+
+| Function | Description |
+|---|---|
+| `clearScreen()` | Clear the display buffer and prepare a new frame |
+| `drawHeader(title)` | Draw the standard section header bar |
+| `drawTextAt(x, y, text, bold)` | Draw text at a pixel position |
+| `drawCenteredLarge(text)` | Draw text centred on screen in a large font |
+| `refreshDisplay()` | Push the frame buffer to the e-ink panel |
+| `waitForEvent()` | Block until a button gesture; returns `PALA_CLICK` / `PALA_DOUBLE` / `PALA_TRIPLE` / `PALA_LONG` |
+| `snprintf_wrap(buf, len, fmt, ...)` | Standard `snprintf` |
+
+Return from `app_main` to exit back to the Apps menu. Apps decide their own exit gesture — the firmware does not impose one.
+
+**Constraints (v1):**
+- Apps must be compiled `-fPIC -mlongcalls` (position-independent).
+- Apps must not use static mutable variables — the loader does not patch `.data` relocations.
+- Maximum binary size: 48 KB.
 
 ## Features
 
