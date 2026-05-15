@@ -9,7 +9,7 @@ The goal of the project was to create a simple, distraction-free reading device 
 
 If you improve the firmware, add features or fix bugs, feel free to open a pull request.
 Please clearly mention:
-- which board version you modified
+- which board version(s) you tested on (V1.1, V1.2, or both)
 - what was changed
 - how it was tested
 
@@ -18,8 +18,10 @@ Please clearly mention:
 There are currently two supported Heltec Wireless Paper versions:
 - `Heltec V1.1`
 - `Heltec V1.2`
-Please make sure to use the correct firmware version for your specific board revision.
+
 The board version is usually printed on the back of the PCB.
+
+Both versions are built from the same source file (`Pala_One_2_1/Pala_One_2_1.ino`). Open it in Arduino IDE and uncomment the `#define` at the top that matches your hardware before compiling.
 
 ## Features
 

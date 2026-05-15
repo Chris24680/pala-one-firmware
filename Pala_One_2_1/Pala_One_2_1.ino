@@ -1,5 +1,16 @@
 #include <heltec-eink-modules.h>
-EInkDisplay_WirelessPaperV1_2 display;
+
+// ── Board selection: uncomment the line that matches your hardware ────────────
+#define BOARD_V1_1
+// #define BOARD_V1_2
+// ─────────────────────────────────────────────────────────────────────────────
+#ifdef BOARD_V1_1
+  using DisplayType = EInkDisplay_WirelessPaperV1_1;
+#else
+  using DisplayType = EInkDisplay_WirelessPaperV1_2;
+#endif
+
+DisplayType display;
 
 #include "pala_one_sleep_black_icon_v4.h"
 
@@ -300,7 +311,7 @@ volatile uint32_t g_isrDropCount = 0;
 // ============================================================================
 class HeltecGFXAdapter : public Adafruit_GFX {
 public:
-  explicit HeltecGFXAdapter(EInkDisplay_WirelessPaperV1_2& d)
+  explicit HeltecGFXAdapter(DisplayType& d)
     : Adafruit_GFX(SCREEN_W, SCREEN_H), disp(d) {}
 
   void drawPixel(int16_t x, int16_t y, uint16_t color) override {
@@ -312,7 +323,7 @@ public:
   }
 
 private:
-  EInkDisplay_WirelessPaperV1_2& disp;
+  DisplayType& disp;
 };
 HeltecGFXAdapter gfx(display);
 
