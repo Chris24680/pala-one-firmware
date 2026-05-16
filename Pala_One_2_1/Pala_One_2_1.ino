@@ -1,17 +1,23 @@
 #include <heltec-eink-modules.h>
 
-// ── Board selection: uncomment the line that matches your hardware ────────────
-//#define BOARD_V1_1
-// #define BOARD_V1_2
-// ─────────────────────────────────────────────────────────────────────────────
-
 #include "pala_app.h"
 #include "pala_api.h"
 #include <stdarg.h>
+
+// ── Board selection: uncomment the line that matches your hardware ────────────
+// #define BOARD_V1_1
+// #define BOARD_V1_2
+// ─────────────────────────────────────────────────────────────────────────────
 #ifdef BOARD_V1_1
   using DisplayType = EInkDisplay_WirelessPaperV1_1;
-#else
-  using DisplayType = EInkDisplay_WirelessPaperV1_2;
+  #define BOARD_CHOSEN 
+#endif
+#if defined BOARD_V1_2
+  using DisplayType = EInkDisplay_WirelessPaperV1_1;
+  #define BOARD_CHOSEN 
+#endif
+#ifndef BOARD_CHOSEN
+  #error "Uncomment a board version"
 #endif
 
 DisplayType display;
