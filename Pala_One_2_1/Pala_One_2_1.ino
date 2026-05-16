@@ -13,7 +13,7 @@
   #define BOARD_CHOSEN 
 #endif
 #if defined BOARD_V1_2
-  using DisplayType = EInkDisplay_WirelessPaperV1_1;
+  using DisplayType = EInkDisplay_WirelessPaperV1_2;
   #define BOARD_CHOSEN 
 #endif
 #ifndef BOARD_CHOSEN
