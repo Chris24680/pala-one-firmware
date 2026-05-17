@@ -37,6 +37,8 @@ U8G2_FOR_ADAFRUIT_GFX u8g2;
 #include <esp_heap_caps.h>
 #include <soc/soc.h>
 
+#include "lora_driver.h"
+
 // ============================================================================
 //  Firmware / Product constants
 // ============================================================================
@@ -374,6 +376,7 @@ static void loadSettings();
 static void markUserActivity();
 static void clearButtonQueue();
 static void resetInputFrontend();
+
 
 static bool fsBegin();
 static void ensureBooksDir();
@@ -2638,6 +2641,16 @@ static int api_snprintf_wrap(char* buf, int len, const char* fmt, ...) {
   return r;
 }
 
+static int      api_loraInit(float freq_mhz, float bw_khz, int sf, int cr,
+                              uint8_t sync_word, int tx_power, int preamble, float tcxo_v) {
+    return loraInit(freq_mhz, bw_khz, sf, cr, sync_word, tx_power, preamble, tcxo_v);
+}
+static void     api_loraSleep()                            { loraSleep(); }
+static int      api_loraReady()                            { return g_loraReady ? 1 : 0; }
+static int      api_loraRecv(uint8_t* buf, int maxlen)     { return loraRecv(buf, maxlen); }
+static void     api_loraSend(const uint8_t* buf, int len)  { loraSend(buf, len); }
+static uint32_t api_loraNodeId()                           { return loraNodeId(); }
+
 static void initPalaAPI() {
   g_palaAPI.clearScreen       = api_clearScreen;
   g_palaAPI.drawHeader        = api_drawHeader;
@@ -2654,6 +2667,12 @@ static void initPalaAPI() {
   g_palaAPI.storageRead       = api_storageRead;
   g_palaAPI.storageWrite      = api_storageWrite;
   g_palaAPI.rtcSeconds        = api_rtcSeconds;
+  g_palaAPI.loraInit          = api_loraInit;
+  g_palaAPI.loraSleep         = api_loraSleep;
+  g_palaAPI.loraReady         = api_loraReady;
+  g_palaAPI.loraRecv          = api_loraRecv;
+  g_palaAPI.loraSend          = api_loraSend;
+  g_palaAPI.loraNodeId        = api_loraNodeId;
 }
 
 // ---- App loader -------------------------------------------------------------
@@ -4342,12 +4361,14 @@ static void goToSleep() {
   esp_wifi_stop();
   btStop();
 
+  loraSleep();   // put LoRa radio to sleep before Platform::prepareToSleep() claims the SPI pins
   Platform::prepareToSleep();
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
   esp_sleep_enable_ext0_wakeup((gpio_num_t)BTN, 0);
   delay(50);
   esp_deep_sleep_start();
 }
+
 
 // ============================================================================
 //  Setup
